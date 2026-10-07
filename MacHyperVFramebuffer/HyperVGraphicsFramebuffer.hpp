@@ -39,6 +39,7 @@ private:
   size_t              _cursorConvertDataSize  = kHyperVGraphicsCursorConvertMaxWidth * kHyperVGraphicsCursorConvertMaxHeight
                                                 * kHyperVGraphicsCursorARGBPixelSize;
   bool                _hasCursorHotspot = false;
+  bool                _useHardwareCursor = false;
   
   IODisplayModeID _currentDisplayMode = 4;
   
