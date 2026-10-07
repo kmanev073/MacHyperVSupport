@@ -27,8 +27,14 @@
 #define kHyperVGraphicsBitDepth           32
 #define kHyperVGraphicsBitsPerByte        8
 
+// Cursor shapes larger than 32x32 wedge the synthetic video channel on Hyper-V (every later
+// framebuffer update then fails with the ring buffer full).
 #define kHyperVGraphicsCursorMaxWidth     32
 #define kHyperVGraphicsCursorMaxHeight    32
+// macOS 26 converts 48x48 (and up to 96x96) cursor images even when the hardware cursor descriptor
+// asks for 32x32; the framebuffer converts into a buffer this large and scales the result down.
+#define kHyperVGraphicsCursorConvertMaxWidth   128
+#define kHyperVGraphicsCursorConvertMaxHeight  128
 
 #define kHyperVGraphicsRingBufferSize (64 * PAGE_SIZE)
 #define kHyperVGraphicsMaxPacketSize  (4 * PAGE_SIZE)
