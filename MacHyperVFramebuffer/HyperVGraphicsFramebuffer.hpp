@@ -34,6 +34,10 @@ private:
 
   UInt8               *_cursorData      = nullptr;
   size_t              _cursorDataSize   = kHyperVGraphicsCursorMaxSize;
+  // macOS's converted cursor image (up to 128x128), before scaling it down to fit _cursorData.
+  UInt8               *_cursorConvertData     = nullptr;
+  size_t              _cursorConvertDataSize  = kHyperVGraphicsCursorConvertMaxWidth * kHyperVGraphicsCursorConvertMaxHeight
+                                                * kHyperVGraphicsCursorARGBPixelSize;
   bool                _hasCursorHotspot = false;
   
   IODisplayModeID _currentDisplayMode = 4;
@@ -43,6 +47,7 @@ private:
   //
   inline UInt32 getScreenDepth() { return (_gfxVersion.value == kHyperVGraphicsVersionV3_0) ? kHyperVGraphicsBitDepth2008 : kHyperVGraphicsBitDepth; }
   IOReturn initGraphicsService();
+  void scaleCursor(UInt32 *width, UInt32 *height, UInt32 *hotX, UInt32 *hotY);
   IOReturn buildGraphicsModes();
   IOReturn buildFallbackMode();
 

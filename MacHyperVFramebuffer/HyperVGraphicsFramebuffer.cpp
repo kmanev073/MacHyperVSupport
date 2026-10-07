@@ -65,6 +65,10 @@ bool HyperVGraphicsFramebuffer::start(IOService *provider) {
 void HyperVGraphicsFramebuffer::stop(IOService *provider) {
   HVDBGLOG("Stopping Hyper-V Synthetic Framebuffer");
 
+  if (_cursorConvertData != nullptr) {
+    IOFree(_cursorConvertData, _cursorConvertDataSize);
+    _cursorConvertData = nullptr;
+  }
   if (_cursorData != nullptr) {
     IOFree(_cursorData, _cursorDataSize);
     _cursorData = nullptr;
@@ -284,9 +288,19 @@ IOReturn HyperVGraphicsFramebuffer::setCursorImage(void *cursorImage) {
       return kIOReturnUnsupported;
     }
   }
+  if (_cursorConvertData == nullptr) {
+    _cursorConvertData = static_cast<UInt8*>(IOMalloc(_cursorConvertDataSize));
+    if (_cursorConvertData == nullptr) {
+      HVSYSLOG("Failed to allocate memory for hardware cursor conversion");
+      return kIOReturnUnsupported;
+    }
+  }
 
   //
   // Setup cursor descriptor / info structures and convert the cursor image.
+  // macOS 26 converts 48x48 and larger cursor images even though the descriptor asks for 32x32.
+  // Those overflowed a 32x32 buffer and were then rejected by HyperVGraphics, which left an
+  // invisible cursor. Convert into a buffer large enough for them and scale the result down.
   //
   bzero(&cursorDescriptor, sizeof (cursorDescriptor));
   cursorDescriptor.majorVersion = kHardwareCursorDescriptorMajorVersion;
@@ -298,25 +312,77 @@ IOReturn HyperVGraphicsFramebuffer::setCursorImage(void *cursorImage) {
   bzero(&cursorInfo, sizeof (cursorInfo));
   cursorInfo.majorVersion       = kHardwareCursorInfoMajorVersion;
   cursorInfo.minorVersion       = kHardwareCursorInfoMinorVersion;
-  cursorInfo.hardwareCursorData = _cursorData;
+  cursorInfo.hardwareCursorData = _cursorConvertData;
 
   if (!convertCursorImage(cursorImage, &cursorDescriptor, &cursorInfo)) {
     HVSYSLOG("Failed to convert hardware cursor image");
     return kIOReturnUnsupported;
   }
-  if ((cursorInfo.cursorWidth == 0) || (cursorInfo.cursorHeight == 0)) {
-    HVSYSLOG("Converted hardware cursor image is invalid size");
+  if ((cursorInfo.cursorWidth == 0) || (cursorInfo.cursorHeight == 0)
+      || (cursorInfo.cursorWidth > kHyperVGraphicsCursorConvertMaxWidth)
+      || (cursorInfo.cursorHeight > kHyperVGraphicsCursorConvertMaxHeight)) {
+    HVSYSLOG("Converted hardware cursor image is invalid size (%ux%u)", cursorInfo.cursorWidth, cursorInfo.cursorHeight);
     return kIOReturnUnsupported;
   }
-  HVDBGLOG("Converted hardware cursor image at %p (%ux%u)", _cursorData, cursorInfo.cursorWidth, cursorInfo.cursorHeight);
+  HVDBGLOG("Converted hardware cursor image at %p (%ux%u)", _cursorConvertData, cursorInfo.cursorWidth, cursorInfo.cursorHeight);
+
+  UInt32 width  = cursorInfo.cursorWidth;
+  UInt32 height = cursorInfo.cursorHeight;
+  UInt32 hotX   = _hasCursorHotspot ? cursorInfo.cursorHotSpotX : 0;
+  UInt32 hotY   = _hasCursorHotspot ? cursorInfo.cursorHotSpotY : 0;
+  scaleCursor(&width, &height, &hotX, &hotY);
 
   HyperVGraphicsPlatformFunctionSetCursorShapeParams cursorParams = { };
   cursorParams.cursorData = _cursorData;
-  cursorParams.width      = cursorInfo.cursorWidth;
-  cursorParams.height     = cursorInfo.cursorHeight;
-  cursorParams.hotX       = _hasCursorHotspot ? cursorInfo.cursorHotSpotX : 0;
-  cursorParams.hotY       = _hasCursorHotspot ? cursorInfo.cursorHotSpotY : 0;
+  cursorParams.width      = width;
+  cursorParams.height     = height;
+  cursorParams.hotX       = hotX;
+  cursorParams.hotY       = hotY;
   return _hvGfxProvider->callPlatformFunction(kHyperVGraphicsPlatformFunctionSetCursorShape, true, &cursorParams, nullptr, nullptr, nullptr);
+}
+
+void HyperVGraphicsFramebuffer::scaleCursor(UInt32 *width, UInt32 *height, UInt32 *hotX, UInt32 *hotY) {
+  //
+  // Shrink by the smallest whole factor that fits the cursor into 32x32, averaging each
+  // factor x factor block per channel. Rows are packed, ARGB, 4 bytes per pixel.
+  //
+  UInt32 srcWidth  = *width;
+  UInt32 srcHeight = *height;
+  UInt32 factor    = 1;
+  while (((srcWidth + factor - 1) / factor > kHyperVGraphicsCursorMaxWidth)
+         || ((srcHeight + factor - 1) / factor > kHyperVGraphicsCursorMaxHeight)) {
+    factor++;
+  }
+  UInt32 dstWidth  = (srcWidth + factor - 1) / factor;
+  UInt32 dstHeight = (srcHeight + factor - 1) / factor;
+
+  for (UInt32 dstY = 0; dstY < dstHeight; dstY++) {
+    for (UInt32 dstX = 0; dstX < dstWidth; dstX++) {
+      UInt32 sums[kHyperVGraphicsCursorARGBPixelSize] = { };
+      UInt32 count = 0;
+      for (UInt32 y = dstY * factor; (y < (dstY + 1) * factor) && (y < srcHeight); y++) {
+        for (UInt32 x = dstX * factor; (x < (dstX + 1) * factor) && (x < srcWidth); x++) {
+          const UInt8 *pixel = &_cursorConvertData[(y * srcWidth + x) * kHyperVGraphicsCursorARGBPixelSize];
+          for (UInt32 c = 0; c < kHyperVGraphicsCursorARGBPixelSize; c++) {
+            sums[c] += pixel[c];
+          }
+          count++;
+        }
+      }
+      UInt8 *out = &_cursorData[(dstY * dstWidth + dstX) * kHyperVGraphicsCursorARGBPixelSize];
+      for (UInt32 c = 0; c < kHyperVGraphicsCursorARGBPixelSize; c++) {
+        out[c] = static_cast<UInt8>(sums[c] / count);
+      }
+    }
+  }
+
+  if (factor > 1) {
+    HVDBGLOG("Scaled cursor from %ux%u to %ux%u", srcWidth, srcHeight, dstWidth, dstHeight);
+  }
+  *width  = dstWidth;
+  *height = dstHeight;
+  *hotX   = (*hotX / factor < dstWidth) ? *hotX / factor : dstWidth - 1;
+  *hotY   = (*hotY / factor < dstHeight) ? *hotY / factor : dstHeight - 1;
 }
 
 IOReturn HyperVGraphicsFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible) {
